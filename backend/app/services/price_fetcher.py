@@ -20,12 +20,31 @@ Both portals serve the same government-mandated XML schema::
 Files are usually gzipped, but Azure may serve them already decompressed with
 a UTF-8 BOM, so the decoder sniffs the gzip magic bytes instead of trusting the
 ``.gz`` extension.
+
+Scanning at full scale
+----------------------
+A *full* scan means every store of every chain, which is roughly 900 files and
+~10 GB of decompressed XML, so three properties of the portals drive the
+design here:
+
+* **One file already holds a whole catalogue.** ``PriceFull`` is a per-store
+  snapshot of ~13k priced items, and chains republish the same store several
+  times a day. Full coverage therefore means *the newest file per store*
+  (:func:`_latest_per_store`); scanning older revisions of a store adds
+  downloads but no products, so they are skipped.
+* **Shufersal's index repeats itself.** Its pages overlap and it never serves
+  an empty page, so listing stops when a page contributes no new file name
+  rather than when a page comes back empty.
+* **Parsing dominates the clock.** Files are streamed with ``iterparse`` and
+  folded straight into per-barcode aggregates, so memory stays flat no matter
+  how many files a chain publishes.
 """
 
 from __future__ import annotations
 
 import gzip
 import html
+import io
 import logging
 import re
 import xml.etree.ElementTree as ET
@@ -34,7 +53,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Iterator, Sequence
+from typing import Iterable, Iterator, Sequence
 
 import httpx
 
@@ -47,6 +66,21 @@ SHUFERSAL_PRICE_FULL_CATEGORY = 2
 CERBERUS_BASE = "https://url.publishedprices.co.il"
 USER_AGENT = "the-right-basket/0.1 (price transparency ingest)"
 REQUEST_TIMEOUT = httpx.Timeout(30.0, read=180.0)
+
+#: Hard stop for Shufersal's self-repeating index. Its ~423 stores arrive 20
+#: per page, so this leaves generous headroom while bounding a runaway loop.
+MAX_LISTING_PAGES = 400
+#: Shufersal's index is walked this many pages at a time; a whole batch
+#: yielding no new name is what marks the end of the index.
+LISTING_BATCH_PAGES = 12
+#: Concurrent downloads within one chain, and chains scanned at once. The
+#: product of the two is the load placed on the portals, so keep it modest.
+DOWNLOAD_WORKERS = 6
+CHAIN_WORKERS = 4
+#: Supabase rejects very large request bodies, so writes go out in batches.
+UPSERT_CHUNK = 500
+#: ``in_`` filters travel in the query string, which has a length limit.
+SELECT_CHUNK = 200
 
 _CSRF_RE = re.compile(r'<meta name="csrftoken" content="([^"]+)"')
 _BLOB_HREF_RE = re.compile(
@@ -99,8 +133,36 @@ class PriceRecord:
 
 @dataclass(frozen=True)
 class PriceFile:
+    """A published file, split into the store it covers and when it was cut.
+
+    Published names look like
+    ``PriceFull7290058140886-001-001-20260909-001008.gz``: chain id, then the
+    store's sub-chain/branch segments, then the publication date and time.
+    Some chains omit the sub-chain or fuse date and time, so the trailing
+    timestamp is identified by segment length rather than by position.
+    """
+
     name: str
     url: str | None = None  # absolute (Shufersal); Cerberus builds it per-session
+    store_key: str = ""
+    stamp: str = ""
+
+    @classmethod
+    def parse(cls, name: str, url: str | None = None) -> "PriceFile":
+        parts = name.split(".", 1)[0].split("-")
+        stamp: list[str] = []
+        # A trailing HHMM/HHMMSS time, then the YYYYMMDD date (or a fused
+        # YYYYMMDDHHMM). Store segments are shorter, so they are left alone.
+        if len(parts) > 2 and parts[-1].isdigit() and len(parts[-1]) in (4, 6):
+            stamp.insert(0, parts.pop())
+        if len(parts) > 1 and parts[-1].isdigit() and len(parts[-1]) in (8, 12, 14):
+            stamp.insert(0, parts.pop())
+        return cls(
+            name=name,
+            url=url,
+            store_key="-".join(parts[1:]) or parts[0],
+            stamp="".join(stamp),
+        )
 
 
 @dataclass
@@ -114,6 +176,7 @@ class SyncResult:
     prices_upserted: int = 0
     files_scanned: int = 0
     per_chain: dict[str, int] = field(default_factory=dict)
+    per_chain_files: dict[str, int] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
     duration_seconds: float = 0.0
 
@@ -139,32 +202,64 @@ def _text(item: ET.Element, *tags: str) -> str:
     return ""
 
 
-def parse_price_file(raw: bytes) -> Iterator[PriceRecord]:
-    """Yield a :class:`PriceRecord` per priced item in one published file."""
-    root = ET.fromstring(_decode(raw))
-    store_id = _text(root, "StoreID", "StoreId")
+def _chunks(values: Sequence, size: int) -> Iterator[Sequence]:
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
 
-    for item in root.iter():
-        if item.tag not in ("Item", "Product"):
+
+def parse_price_file(raw: bytes) -> Iterator[PriceRecord]:
+    """Yield a :class:`PriceRecord` per priced item in one published file.
+
+    Streams the document and discards each item once read: a store file is
+    ~11 MB of XML, and a full scan holds several in flight at once.
+    """
+    store_id = ""
+    for _, element in ET.iterparse(io.StringIO(_decode(raw)), events=("end",)):
+        if element.tag in ("StoreID", "StoreId"):
+            if not store_id:
+                store_id = (element.text or "").strip()
             continue
-        barcode = _text(item, "ItemCode", "PriceCode")
+        if element.tag not in ("Item", "Product"):
+            continue
+
+        barcode = _text(element, "ItemCode", "PriceCode")
+        raw_price = _text(element, "ItemPrice", "Price")
+        name = _text(element, "ItemName", "ItemNm")
+        brand = _text(element, "ManufactureName", "ManufacturerName")
+        unit = _text(element, "UnitOfMeasure", "UnitQty")
+        element.clear()  # release the item's children before moving on
+
         if not barcode:
             continue
         try:
-            price = Decimal(_text(item, "ItemPrice", "Price") or "0")
+            price = Decimal(raw_price or "0")
         except InvalidOperation:
             continue
         if price <= 0:
             continue  # unpriced or delisted row
-        brand = _text(item, "ManufactureName", "ManufacturerName")
         yield PriceRecord(
             barcode=barcode,
-            name=_text(item, "ItemName", "ItemNm") or barcode,
+            name=name or barcode,
             price=price,
             brand=None if brand in ("", "לא ידוע") else brand,
-            unit_of_measure=_text(item, "UnitOfMeasure", "UnitQty") or None,
+            unit_of_measure=unit or None,
             store_id=store_id,
         )
+
+
+def _latest_per_store(files: Iterable[PriceFile]) -> list[PriceFile]:
+    """Keep each store's newest file, newest store first.
+
+    Chains republish a store several times a day and leave months of older
+    revisions in the index; every one of them carries the same catalogue, so
+    only the freshest is worth downloading.
+    """
+    newest: dict[str, PriceFile] = {}
+    for price_file in files:
+        current = newest.get(price_file.store_key)
+        if current is None or price_file.stamp > current.stamp:
+            newest[price_file.store_key] = price_file
+    return sorted(newest.values(), key=lambda f: (f.stamp, f.name), reverse=True)
 
 
 class ShufersalPortal:
@@ -173,29 +268,50 @@ class ShufersalPortal:
     def __init__(self, client: httpx.Client) -> None:
         self._client = client
 
-    def list_price_files(self, limit: int) -> list[PriceFile]:
-        files: list[PriceFile] = []
-        page = 1
-        while len(files) < limit and page <= 5:
-            response = self._client.get(
-                SHUFERSAL_LISTING,
-                params={
-                    "catID": SHUFERSAL_PRICE_FULL_CATEGORY,
-                    "storeId": 0,
-                    "page": page,
-                },
-            )
-            response.raise_for_status()
-            # Unescape &amp; or the SAS signature is corrupted and Azure 403s.
-            urls = [html.unescape(u) for u in _BLOB_HREF_RE.findall(response.text)]
-            if not urls:
-                break
-            for url in urls:
-                name = url.split("/")[-1].split("?")[0]
-                if name.startswith("PriceFull"):
-                    files.append(PriceFile(name=name, url=url))
-            page += 1
-        return files[:limit]
+    def _page(self, page: int) -> list[tuple[str, str]]:
+        """Return ``(file_name, signed_url)`` for one page of the index."""
+        response = self._client.get(
+            SHUFERSAL_LISTING,
+            params={
+                "catID": SHUFERSAL_PRICE_FULL_CATEGORY,
+                "storeId": 0,
+                "page": page,
+            },
+        )
+        response.raise_for_status()
+        # Unescape &amp; or the SAS signature is corrupted and Azure 403s.
+        urls = [html.unescape(u) for u in _BLOB_HREF_RE.findall(response.text)]
+        return [(url.split("/")[-1].split("?")[0], url) for url in urls]
+
+    def list_price_files(self, limit: int | None) -> list[PriceFile]:
+        """List PriceFull files, walking the index until it stops giving more.
+
+        The index has one quirk that dictates the loop: its pages overlap, and
+        once past the end the portal keeps re-serving the final page instead of
+        an empty one. So exhaustion is detected by a batch of pages that adds
+        no new file name, not by an empty response. Pages are fetched a batch
+        at a time because there are ~215 of them at 20 files each.
+        """
+        seen: dict[str, PriceFile] = {}
+        with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+            for start in range(1, MAX_LISTING_PAGES + 1, LISTING_BATCH_PAGES):
+                batch = range(start, start + LISTING_BATCH_PAGES)
+                added = 0
+                empty = True
+                for entries in pool.map(self._page, batch):
+                    if entries:
+                        empty = False
+                    for name, url in entries:
+                        if name.startswith("PriceFull") and name not in seen:
+                            seen[name] = PriceFile.parse(name, url)
+                            added += 1
+                if empty or added == 0:
+                    break
+                if limit is not None and len(seen) >= limit:
+                    break
+
+        files = _latest_per_store(seen.values())
+        return files if limit is None else files[:limit]
 
     def download(self, price_file: PriceFile) -> bytes:
         assert price_file.url is not None
@@ -231,7 +347,7 @@ class CerberusPortal:
         rotated = _CSRF_RE.search(authed.text)
         self._token = rotated.group(1) if rotated else match.group(1)
 
-    def list_price_files(self, limit: int) -> list[PriceFile]:
+    def list_price_files(self, limit: int | None) -> list[PriceFile]:
         if self._token is None:
             self._login()
         response = self._client.post(
@@ -250,15 +366,12 @@ class CerberusPortal:
         )
         response.raise_for_status()
         rows = response.json().get("aaData", [])
-        names = sorted(
-            (
-                str(row["name"])
-                for row in rows
-                if str(row.get("name", "")).startswith("PriceFull")
-            ),
-            reverse=True,  # newest timestamp first
+        files = _latest_per_store(
+            PriceFile.parse(str(row["name"]))
+            for row in rows
+            if str(row.get("name", "")).startswith("PriceFull")
         )
-        return [PriceFile(name=name) for name in names[:limit]]
+        return files if limit is None else files[:limit]
 
     def download(self, price_file: PriceFile) -> bytes:
         response = self._client.get(f"{CERBERUS_BASE}/file/d/{price_file.name}")
@@ -266,30 +379,62 @@ class CerberusPortal:
         return response.content
 
 
-def _representative(records: Sequence[PriceRecord]) -> PriceRecord:
-    """Collapse per-store rows into one chain-level price.
+@dataclass
+class _Aggregate:
+    """Running per-barcode tally across every store file of one chain.
 
-    Chains price most items uniformly, so the modal price across the sampled
-    stores is the chain's shelf price. Ties break toward the cheaper value.
+    Only the price histogram is kept rather than each store's row, so a chain
+    with hundreds of stores costs the same memory as one with two.
     """
-    counts = Counter(record.price for record in records)
-    chosen = min(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
-    return next(record for record in records if record.price == chosen)
+
+    name: str
+    brand: str | None
+    unit_of_measure: str | None
+    barcode: str
+    prices: Counter = field(default_factory=Counter)
+
+    def add(self, record: PriceRecord) -> None:
+        self.prices[record.price] += 1
+        # Later files fill in details an earlier store left blank.
+        if self.brand is None and record.brand:
+            self.brand = record.brand
+        if self.unit_of_measure is None and record.unit_of_measure:
+            self.unit_of_measure = record.unit_of_measure
+
+    def representative(self) -> PriceRecord:
+        """Collapse per-store rows into one chain-level price.
+
+        Chains price most items uniformly, so the modal price across the
+        chain's stores is its shelf price. Ties break toward the cheaper value.
+        """
+        price = min(self.prices.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+        return PriceRecord(
+            barcode=self.barcode,
+            name=self.name,
+            price=price,
+            brand=self.brand,
+            unit_of_measure=self.unit_of_measure,
+        )
 
 
 def fetch_chain_prices(
     chain: Chain,
     barcodes: Sequence[str] | None = None,
-    max_files: int = 2,
-    max_products: int = 50,
+    max_files: int | None = None,
+    max_products: int | None = None,
 ) -> tuple[dict[str, PriceRecord], int]:
     """Fetch one chain's prices, returning ``{normalized_barcode: record}``.
 
-    When ``barcodes`` is empty the newest files are sampled instead and up to
-    ``max_products`` items are returned, which seeds an empty database.
+    ``max_files`` and ``max_products`` are optional caps for quick sampling
+    runs; left as ``None`` the scan is exhaustive, covering every store the
+    chain publishes and every priced item in those files.
+
+    When ``barcodes`` is empty the whole catalogue is ingested, which seeds an
+    empty database; when it is given, scanning stops as soon as every
+    requested barcode has been seen.
     """
     wanted = {normalize_barcode(b) for b in barcodes} if barcodes else None
-    collected: dict[str, list[PriceRecord]] = {}
+    collected: dict[str, _Aggregate] = {}
     files_scanned = 0
 
     with httpx.Client(
@@ -307,21 +452,72 @@ def fetch_chain_prices(
         else:
             raise ValueError(f"unknown portal {chain.portal!r}")
 
-        for price_file in portal.list_price_files(max_files):
-            raw = portal.download(price_file)
-            files_scanned += 1
-            for record in parse_price_file(raw):
-                key = normalize_barcode(record.barcode)
-                if wanted is not None:
-                    if key not in wanted:
-                        continue
-                elif key not in collected and len(collected) >= max_products:
-                    continue
-                collected.setdefault(key, []).append(record)
-            if wanted is not None and wanted.issubset(collected):
-                break  # every requested barcode found; stop early
+        files = portal.list_price_files(max_files)
+        logger.info("chain %s: scanning %d store files", chain.code, len(files))
 
-    return {key: _representative(rows) for key, rows in collected.items()}, files_scanned
+        # Downloads are the slow part and parsing holds the GIL, so files are
+        # fetched concurrently and folded in as they land.
+        with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+            futures = {
+                pool.submit(portal.download, price_file): price_file
+                for price_file in files
+            }
+            try:
+                for future in as_completed(futures):
+                    price_file = futures[future]
+                    try:
+                        raw = future.result()
+                    except Exception as exc:  # a dead store file, not a dead chain
+                        logger.warning(
+                            "chain %s: %s failed: %s", chain.code, price_file.name, exc
+                        )
+                        continue
+
+                    files_scanned += 1
+                    for record in parse_price_file(raw):
+                        key = normalize_barcode(record.barcode)
+                        existing = collected.get(key)
+                        if existing is not None:
+                            existing.add(record)
+                            continue
+                        if wanted is not None and key not in wanted:
+                            continue
+                        if (
+                            wanted is None
+                            and max_products is not None
+                            and len(collected) >= max_products
+                        ):
+                            continue
+                        aggregate = _Aggregate(
+                            name=record.name,
+                            brand=record.brand,
+                            unit_of_measure=record.unit_of_measure,
+                            barcode=record.barcode,
+                        )
+                        aggregate.add(record)
+                        collected[key] = aggregate
+
+                    if files_scanned % 25 == 0:
+                        logger.info(
+                            "chain %s: %d/%d files, %d products",
+                            chain.code,
+                            files_scanned,
+                            len(files),
+                            len(collected),
+                        )
+                    if wanted is not None and wanted.issubset(collected):
+                        break  # every requested barcode found; stop early
+            finally:
+                for future in futures:
+                    future.cancel()
+
+    logger.info(
+        "chain %s: done, %d files, %d products",
+        chain.code,
+        files_scanned,
+        len(collected),
+    )
+    return {key: agg.representative() for key, agg in collected.items()}, files_scanned
 
 
 def _sync_chain_rows(chains: Sequence[Chain]) -> dict[str, str]:
@@ -340,42 +536,68 @@ def _sync_chain_rows(chains: Sequence[Chain]) -> dict[str, str]:
 
 
 def _sync_product_rows(records: Sequence[PriceRecord]) -> dict[str, str]:
-    """Upsert product rows by barcode, returning ``{barcode: product_uuid}``."""
+    """Upsert product rows by barcode, returning ``{barcode: product_uuid}``.
+
+    A full scan carries six figures of barcodes, so rows are written in
+    batches and the ids are taken from what each upsert returns instead of
+    reading them back.
+    """
     by_barcode: dict[str, PriceRecord] = {}
     for record in records:
         by_barcode.setdefault(record.barcode, record)
     if not by_barcode:
         return {}
 
-    supabase.table("products").upsert(
-        [
-            {
-                "barcode": record.barcode,
-                "name": record.name,
-                "brand": record.brand,
-                "unit_of_measure": record.unit_of_measure,
-            }
-            for record in by_barcode.values()
-        ],
-        on_conflict="barcode",
-    ).execute()
-    rows = (
-        supabase.table("products")
-        .select("id,barcode")
-        .in_("barcode", list(by_barcode))
-        .execute()
-        .data
-    )
-    return {row["barcode"]: row["id"] for row in rows}
+    payload = [
+        {
+            "barcode": record.barcode,
+            "name": record.name,
+            "brand": record.brand,
+            "unit_of_measure": record.unit_of_measure,
+        }
+        for record in by_barcode.values()
+    ]
+
+    product_ids: dict[str, str] = {}
+    for index, chunk in enumerate(_chunks(payload, UPSERT_CHUNK), start=1):
+        response = (
+            supabase.table("products")
+            .upsert(chunk, on_conflict="barcode")
+            .execute()
+        )
+        for row in response.data or []:
+            product_ids[row["barcode"]] = row["id"]
+        logger.info(
+            "products: upserted %d/%d", min(index * UPSERT_CHUNK, len(payload)),
+            len(payload),
+        )
+
+    # Older PostgREST builds can answer an upsert without a representation;
+    # fall back to reading back only the ids that are still missing.
+    missing = [barcode for barcode in by_barcode if barcode not in product_ids]
+    for chunk in _chunks(missing, SELECT_CHUNK):
+        rows = (
+            supabase.table("products")
+            .select("id,barcode")
+            .in_("barcode", list(chunk))
+            .execute()
+            .data
+        )
+        for row in rows:
+            product_ids[row["barcode"]] = row["id"]
+    return product_ids
 
 
 def sync_prices(
     barcodes: Sequence[str] | None = None,
     chain_codes: Sequence[str] | None = None,
-    max_files_per_chain: int = 2,
-    max_products: int = 50,
+    max_files_per_chain: int | None = None,
+    max_products: int | None = None,
 ) -> SyncResult:
     """Scan the published files for the given chains and persist to Supabase.
+
+    With the caps left at ``None`` this is a full scan: every store file each
+    chain publishes, and every priced item within them.
 
     Each chain is fetched in its own thread; one chain failing (portal down,
     credentials rotated) is recorded in ``errors`` and does not abort the rest.
@@ -385,7 +607,7 @@ def sync_prices(
     result = SyncResult(barcodes_requested=len(barcodes or []))
 
     fetched: dict[str, dict[str, PriceRecord]] = {}
-    with ThreadPoolExecutor(max_workers=min(6, len(selected))) as pool:
+    with ThreadPoolExecutor(max_workers=min(CHAIN_WORKERS, len(selected))) as pool:
         futures = {
             pool.submit(
                 fetch_chain_prices, chain, barcodes, max_files_per_chain, max_products
@@ -403,6 +625,7 @@ def sync_prices(
             fetched[chain.code] = records
             result.files_scanned += files_scanned
             result.per_chain[chain.code] = len(records)
+            result.per_chain_files[chain.code] = files_scanned
             result.chains_synced.append(chain.code)
 
     if not fetched:
@@ -418,8 +641,10 @@ def sync_prices(
     result.barcodes_found = len({normalize_barcode(r.barcode) for r in all_records})
 
     now = datetime.now(timezone.utc).isoformat()
-    price_rows = [
-        {
+    # Keyed so a barcode that appears twice for one chain cannot produce two
+    # conflicting rows in the same statement, which Postgres refuses.
+    price_rows: dict[tuple[str, str], dict] = {
+        (product_ids[record.barcode], chain_ids[chain_code]): {
             "product_id": product_ids[record.barcode],
             "chain_id": chain_ids[chain_code],
             "price": float(record.price),
@@ -431,12 +656,14 @@ def sync_prices(
         for chain_code, records in fetched.items()
         for record in records.values()
         if record.barcode in product_ids and chain_code in chain_ids
-    ]
-    if price_rows:
+    }
+    rows = list(price_rows.values())
+    for index, chunk in enumerate(_chunks(rows, UPSERT_CHUNK), start=1):
         supabase.table("store_prices").upsert(
-            price_rows, on_conflict="product_id,chain_id"
+            list(chunk), on_conflict="product_id,chain_id"
         ).execute()
-        result.prices_upserted = len(price_rows)
+        result.prices_upserted += len(chunk)
+        logger.info("store_prices: upserted %d/%d", result.prices_upserted, len(rows))
 
     result.duration_seconds = (datetime.now(timezone.utc) - started).total_seconds()
     return result

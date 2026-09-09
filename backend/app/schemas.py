@@ -8,18 +8,27 @@ from pydantic import BaseModel, Field
 
 
 class SyncPricesRequest(BaseModel):
-    """Which products and chains to scan.
+    """Which products and chains to scan, and how far to go.
 
-    Leaving ``barcodes`` empty switches to seeding mode: the newest published
-    files are sampled and up to ``max_products`` items per chain are ingested.
+    Every field defaults to "everything": an empty body runs a full scan of
+    each chain's whole catalogue across all of its stores. The two caps exist
+    for quick sampling runs and are off unless set.
     """
 
     barcodes: list[str] = Field(default_factory=list, max_length=200)
     chains: list[str] = Field(
         default_factory=list, description="Chain codes; empty means every chain."
     )
-    max_files_per_chain: int = Field(2, ge=1, le=10)
-    max_products: int = Field(50, ge=1, le=500)
+    max_files_per_chain: int | None = Field(
+        None,
+        ge=1,
+        description="Cap on store files per chain; omit to scan every store.",
+    )
+    max_products: int | None = Field(
+        None,
+        ge=1,
+        description="Cap on products per chain; omit to ingest the full catalogue.",
+    )
 
 
 class SyncPricesResponse(BaseModel):
@@ -30,6 +39,7 @@ class SyncPricesResponse(BaseModel):
     prices_upserted: int
     files_scanned: int
     per_chain: dict[str, int]
+    per_chain_files: dict[str, int]
     errors: dict[str, str]
     duration_seconds: float
 

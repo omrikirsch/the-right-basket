@@ -79,17 +79,20 @@ Both serve the same mandated XML (`Root/Items/Item`), keyed by barcode
 | `POST` | `/api/sync-prices` | Scan the portals and upsert into Supabase |
 | `GET` | `/api/products` | Ingested products with their price per chain |
 
-Sync specific barcodes across every chain:
+Run a full scan — every chain, every store, whole catalogue:
 
 ```bash
 curl -X POST http://localhost:8000/api/sync-prices \
-  -H "Content-Type: application/json" \
-  -d '{"barcodes":["7290004131074"],"max_files_per_chain":1}'
+  -H "Content-Type: application/json" -d '{}'
 ```
 
-Omit `barcodes` to seed an empty database from the newest published files
-(`max_products` caps how many items per chain are taken). Restrict the run with
-`{"chains":["shufersal","rami_levy"]}`. A chain that fails is reported in
+That is the default because the request body is all-optional. It scans ~900
+store files and takes about six minutes, so allow a generous client timeout.
+
+Narrow the run when you do not need everything: `{"chains":["shufersal"]}` for
+one chain, `{"barcodes":["7290004131074"]}` to chase specific products (it
+stops as soon as all of them are found), or `max_files_per_chain` /
+`max_products` to cap a quick sampling run. A chain that fails is reported in
 `errors` rather than failing the whole call.
 
 Read the results, cheapest chain first per product:
@@ -98,11 +101,14 @@ Read the results, cheapest chain first per product:
 curl "http://localhost:8000/api/products?priced_only=true&limit=10"
 ```
 
-Each chain publishes per-store files, so a sync samples the newest
-`max_files_per_chain` stores and stores the modal price as the chain price.
-Raising that value costs time but widens coverage. Promotional prices live in
-separate `PromoFull` files, which are not ingested yet — `is_discount` is
-therefore always `false`.
+Each chain publishes one `PriceFull` file per store, and republishes the same
+store several times a day. A file already holds that store's whole catalogue,
+so a full scan takes the newest file per store and skips the older revisions,
+which cost a download but add no products. The price stored for a chain is the
+modal price across its stores, since chains price most items uniformly.
+
+Promotional prices live in separate `PromoFull` files, which are not ingested
+yet — `is_discount` is therefore always `false`.
 
 
 ## Environment variables
