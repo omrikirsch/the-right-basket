@@ -67,10 +67,14 @@ Both `.env.example` files are committed as templates; the real `.env` /
 | `DATABASE_URL` | `sqlite:///./local.db` | Database connection string |
 | `SECRET_KEY` | `dev-secret-change-me` | Signs tokens/sessions — change it |
 | `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated allowed origins |
+| `SUPABASE_URL` | — | Supabase project URL |
+| `SUPABASE_KEY` | — | Supabase API key |
 
 | Frontend (`frontend/.env.local`) | Default | Purpose |
 | --- | --- | --- |
 | `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Base URL of the backend |
+| `NEXT_PUBLIC_SUPABASE_URL` | — | Supabase project URL |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | — | Supabase anon/publishable key |
 
 ## Other frontend commands
 

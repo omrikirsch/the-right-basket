@@ -27,6 +27,8 @@ class Settings:
     secret_key: str = field(
         default_factory=lambda: os.getenv("SECRET_KEY", "dev-secret-change-me")
     )
+    supabase_url: str = field(default_factory=lambda: os.getenv("SUPABASE_URL", ""))
+    supabase_key: str = field(default_factory=lambda: os.getenv("SUPABASE_KEY", ""))
     cors_origins: list[str] = field(
         default_factory=lambda: _split_csv(
             os.getenv("CORS_ORIGINS", "http://localhost:3000")
