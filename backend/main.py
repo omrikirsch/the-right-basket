@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.routers import prices, products
 
 app = FastAPI(
     title="The Right Basket API",
@@ -15,6 +16,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+app.include_router(products.router)
+app.include_router(prices.router)
 
 
 @app.get("/healthcheck", tags=["system"])

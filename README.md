@@ -55,6 +55,56 @@ The app runs on **http://localhost:3000**. The home page calls the backend's
 `/healthcheck` and shows whether the API is reachable, so you can confirm both
 services are wired together.
 
+## Price engine
+
+`backend/app/services/price_fetcher.py` ingests the price files that Israeli
+retail chains must publish under the food-price transparency law
+(חוק קידום התחרות בענף המזון, 2014). Eleven chains are wired up and verified
+against the live portals:
+
+- **Shufersal** — public Azure blob, indexed at `prices.shufersal.co.il`
+- **Ten chains via the shared Cerberus portal** (`url.publishedprices.co.il`):
+  רמי לוי, יוחננוף, אושר עד, טיב טעם, דור אלון, קשת טעמים, פרש מרקט,
+  סטופ מרקט, סאלח דבאח, פוליצר
+
+Both serve the same mandated XML (`Root/Items/Item`), keyed by barcode
+(`ItemCode`). Data lands in the `products`, `chains` and `store_prices` tables.
+
+### Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/healthcheck` | Liveness probe |
+| `GET` | `/api/chains` | Chains the engine can scan |
+| `POST` | `/api/sync-prices` | Scan the portals and upsert into Supabase |
+| `GET` | `/api/products` | Ingested products with their price per chain |
+
+Sync specific barcodes across every chain:
+
+```bash
+curl -X POST http://localhost:8000/api/sync-prices \
+  -H "Content-Type: application/json" \
+  -d '{"barcodes":["7290004131074"],"max_files_per_chain":1}'
+```
+
+Omit `barcodes` to seed an empty database from the newest published files
+(`max_products` caps how many items per chain are taken). Restrict the run with
+`{"chains":["shufersal","rami_levy"]}`. A chain that fails is reported in
+`errors` rather than failing the whole call.
+
+Read the results, cheapest chain first per product:
+
+```bash
+curl "http://localhost:8000/api/products?priced_only=true&limit=10"
+```
+
+Each chain publishes per-store files, so a sync samples the newest
+`max_files_per_chain` stores and stores the modal price as the chain price.
+Raising that value costs time but widens coverage. Promotional prices live in
+separate `PromoFull` files, which are not ingested yet — `is_discount` is
+therefore always `false`.
+
+
 ## Environment variables
 
 Both `.env.example` files are committed as templates; the real `.env` /
